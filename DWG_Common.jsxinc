@@ -1,0 +1,425 @@
+// DWG_Common.jsxinc - shared pen table + helpers for the DWG_*.jsx Illustrator scripts.
+// Keep this file next to the .jsx files (they #include it).
+//
+// EDIT THE PEN TABLE HERE. Weights are points at print size; k = % black (100 = black).
+// "enforce: true" layers are re-styled every time you run DWG_Setup or DWG_UpdateLinework.
+// Layers without enforce (PEOPLE, ENTOURAGE, TONE, ANNOTATION) are left alone, so anything you
+// style by hand there keeps its look.
+
+var DWG_PRESETS = {
+    // heavy black poche, thin everything else (crisp, high contrast plans)
+    "Solid poche": {
+        CUT:       { w: 0.80, k: 100, cap: "butt", join: "miter" },
+        POCHE:     { fill: 100 }
+    },
+    // cut walls drawn as heavy outlines, no fill (minimal, airy)
+    "Outline cut": {
+        CUT:       { w: 1.00, k: 100, cap: "butt", join: "miter" },
+        POCHE:     { fill: 0, hide: true }
+    },
+    // light grey poche with a firm outline (good for large-scale sections)
+    "Grey poche": {
+        CUT:       { w: 0.60, k: 100, cap: "butt", join: "miter" },
+        POCHE:     { fill: 25 }
+    }
+};
+
+var DWG_BASE_PENS = {
+    OVERHEAD:  { w: 0.25, k: 100, dash: [4, 2] },
+    PROFILE:   { w: 0.50, k: 100 },
+    OUTLINE:   { w: 0.30, k: 100 },
+    GLAZING:   { w: 0.15, k: 100 },
+    FURNITURE: { w: 0.18, k: 85 },
+    EDGE:      { w: 0.15, k: 100 },
+    HIDDEN:    { w: 0.20, k: 100, dash: [2, 1.5] },
+    BEYOND:    { w: 0.12, k: 70 },
+    BEYOND2:   { w: 0.10, k: 45 },
+    PLANTING:  { w: 0.15, k: 80 },
+    CONTEXT:   { w: 0.20, k: 50 }
+};
+
+// Illustrator layer stack, TOP -> BOTTOM.  role: "line" = linework from Rhino (replaced by
+// DWG_UpdateLinework), "add" = your additions (never touched by updates).
+var DWG_STACK = [
+    { name: "ANNOTATION", role: "add",  note: "text, labels, scale bar, north arrow" },
+    { name: "REG",        role: "line", note: "registration mark from Rhino (hidden, do not move)" },
+    { name: "OVERHEAD",   role: "line" },
+    { name: "CUT",        role: "line" },
+    { name: "POCHE",      role: "line" },
+    { name: "PEOPLE",     role: "add",  note: "people / scale figures" },
+    { name: "ENTOURAGE",  role: "add",  note: "furniture, trees, plants placed in Illustrator" },
+    { name: "PROFILE",    role: "line" },
+    { name: "OUTLINE",    role: "line" },
+    { name: "GLAZING",    role: "line" },
+    { name: "FURNITURE",  role: "line" },
+    { name: "EDGE",       role: "line" },
+    { name: "HIDDEN",     role: "line" },
+    { name: "BEYOND",     role: "line" },
+    { name: "BEYOND2",    role: "line" },
+    { name: "PLANTING",   role: "line" },
+    { name: "CONTEXT",    role: "line" },
+    { name: "TONE",       role: "add",  note: "floor patterns, hatches, shadows, tone fills" }
+];
+
+// Rules that map OTHER layer names (plain Rhino Make2D, Rhino's own SVG/AI export, DWG files)
+// onto the stack. Tested in order against the full layer/group path, upper-cased.
+var DWG_RULES = [
+    [/HIDDEN/,                                   "HIDDEN"],
+    [/OVERHEAD|ABOVE/,                           "OVERHEAD"],
+    [/GLASS|GLAZ|WINDOW|MULLION/,                "GLAZING"],
+    [/FURN|CHAIR|TABLE|DESK|SOFA|BED\b|CASEWORK/, "FURNITURE"],
+    [/TREE|PLANT|LANDSCAPE|VEGETATION|SHRUB/,    "PLANTING"],
+    [/CONTEXT|NEIGHBO|CADMAPPER|TOPO|CONTOUR/,   "CONTEXT"],
+    [/HATCH|POCHE|FILL/,                         "POCHE"],
+    [/CLIPPING|SECTION|INTERSECTION|\bCUT\b/,    "CUT"],
+    [/SILHOUETTE|PROFILE/,                       "PROFILE"],
+    [/TANGENT|SEAM|EDGE/,                        "EDGE"],
+    [/BEYOND/,                                   "BEYOND"],
+    [/VISIBLE|CURVES|MAKE2D/,                    "OUTLINE"]
+];
+
+// ---------------------------------------------------------------------------
+
+function dwgNorm(s) { return String(s).toUpperCase().replace(/[^A-Z0-9]/g, ""); }
+
+function dwgStackEntry(name) {
+    var n = dwgNorm(name);
+    for (var i = 0; i < DWG_STACK.length; i++) if (dwgNorm(DWG_STACK[i].name) === n) return DWG_STACK[i];
+    return null;
+}
+
+function dwgClassify(pathText) {
+    var t = String(pathText).toUpperCase();
+    for (var i = 0; i < DWG_RULES.length; i++) if (DWG_RULES[i][0].test(t)) return DWG_RULES[i][1];
+    return null;
+}
+
+function dwgPens(presetName, mult) {
+    var pens = {}, k;
+    for (k in DWG_BASE_PENS) pens[k] = dwgCopy(DWG_BASE_PENS[k]);
+    var pre = DWG_PRESETS[presetName] || DWG_PRESETS["Solid poche"];
+    for (k in pre) pens[k] = dwgCopy(pre[k]);
+    for (k in pens) {
+        if (pens[k].w) pens[k].w = Math.round(pens[k].w * (mult || 1) * 1000) / 1000;
+        pens[k].enforce = true;
+    }
+    return pens;
+}
+
+function dwgCopy(o) { var r = {}; for (var k in o) r[k] = o[k]; return r; }
+
+function dwgGray(k) { var g = new GrayColor(); g.gray = k; return g; }
+
+// --- layers ----------------------------------------------------------------
+
+function dwgFindLayer(container, name) {
+    var n = dwgNorm(name);
+    for (var i = 0; i < container.layers.length; i++)
+        if (dwgNorm(container.layers[i].name) === n) return container.layers[i];
+    return null;
+}
+
+function dwgEnsureLayer(doc, name) {
+    var L = dwgFindLayer(doc, name);
+    if (!L) { L = doc.layers.add(); L.name = name; }
+    return L;
+}
+
+function dwgUnlock(L) {
+    L.locked = false;
+    L.visible = true;
+    for (var i = 0; i < L.layers.length; i++) dwgUnlock(L.layers[i]);
+}
+
+function dwgMoveAll(fromContainer, toLayer) {
+    var items = [];
+    for (var i = 0; i < fromContainer.pageItems.length; i++) items.push(fromContainer.pageItems[i]);
+    for (var j = 0; j < items.length; j++) {
+        try { items[j].locked = false; items[j].hidden = false; } catch (e) {}
+        items[j].move(toLayer, ElementPlacement.PLACEATEND);
+    }
+    return items.length;
+}
+
+function dwgIsEmpty(L) { return L.pageItems.length === 0 && L.layers.length === 0; }
+
+// Sorts whatever came in (SVG groups, Rhino/Make2D layers, nested sublayers) into the stack.
+function dwgNormalize(doc) {
+    var moved = 0;
+    var top = [];
+    for (var i = 0; i < doc.layers.length; i++) top.push(doc.layers[i]);
+    for (var t = 0; t < top.length; t++) {
+        var L = top[t];
+        if (L.name.charAt(0) === "_") continue;      // utility layers: _DWG settings, _LIBRARY ...
+        if (dwgStackEntry(L.name)) {
+            dwgUnlock(L);
+            // sublayers inside a stack layer: fold them in
+            moved += dwgFoldSublayers(doc, L, L.name);
+            continue;
+        }
+        dwgUnlock(L);
+        moved += dwgSortContainer(doc, L, L.name);
+        if (dwgIsEmpty(L)) L.remove();
+    }
+    return moved;
+}
+
+function dwgFoldSublayers(doc, L, path) {
+    var moved = 0, subs = [];
+    for (var i = 0; i < L.layers.length; i++) subs.push(L.layers[i]);
+    for (var s = 0; s < subs.length; s++) {
+        moved += dwgSortContainer(doc, subs[s], path + "/" + subs[s].name, L);
+        if (dwgIsEmpty(subs[s])) subs[s].remove();
+    }
+    return moved;
+}
+
+// container = layer or sublayer that is NOT itself a stack layer
+function dwgSortContainer(doc, C, path, fallback) {
+    var moved = 0;
+    // 1) sublayers first (deepest names are the most specific)
+    var subs = [];
+    for (var i = 0; i < C.layers.length; i++) subs.push(C.layers[i]);
+    for (var s = 0; s < subs.length; s++) {
+        dwgUnlock(subs[s]);
+        moved += dwgSortContainer(doc, subs[s], path + "/" + subs[s].name, fallback);
+        if (dwgIsEmpty(subs[s])) subs[s].remove();
+    }
+    // 2) whole container maps to a stack layer?
+    var target = dwgStackEntry(C.name) ? C.name : dwgClassify(path);
+    // 3) top-level groups named like stack layers (SVG import puts <g id="CUT"> here)
+    var items = [];
+    for (var j = 0; j < C.pageItems.length; j++) items.push(C.pageItems[j]);
+    for (var k = 0; k < items.length; k++) {
+        var it = items[k];
+        var nm = it.name || "";
+        var dest = null;
+        if (nm) dest = dwgStackEntry(nm) ? nm : dwgClassify(path + "/" + nm);
+        if (!dest) dest = target;
+        if (!dest && fallback) { it.move(fallback, ElementPlacement.PLACEATEND); moved++; continue; }
+        if (!dest) continue;
+        var entry = dwgStackEntry(dest);
+        var D = dwgEnsureLayer(doc, entry ? entry.name : dest);
+        dwgUnlock(D);
+        try { it.locked = false; it.hidden = false; } catch (e) {}
+        it.move(D, ElementPlacement.PLACEATEND);
+        moved++;
+    }
+    return moved;
+}
+
+function dwgOrderLayers(doc) {
+    // zOrder fails if the layer, or any locked or hidden layer, is in the way:
+    // unlock + show everything, reorder, then put the states back.
+    for (var i = 0; i < DWG_STACK.length; i++) dwgEnsureLayer(doc, DWG_STACK[i].name);
+    var states = [];
+    for (var a = 0; a < doc.layers.length; a++) {
+        var La = doc.layers[a];
+        states.push([La, La.locked, La.visible]);
+        La.locked = false;
+        La.visible = true;
+    }
+    dwgSetActive(doc, "ENTOURAGE");
+    for (var j = 0; j < DWG_STACK.length; j++)
+        dwgFindLayer(doc, DWG_STACK[j].name).zOrder(ZOrderMethod.SENDTOBACK);
+    var st = dwgFindLayer(doc, DWG_SETTINGS_LAYER);
+    if (st) st.zOrder(ZOrderMethod.SENDTOBACK);
+    for (var b = 0; b < states.length; b++) {
+        states[b][0].visible = states[b][2];
+        states[b][0].locked = states[b][1];
+    }
+    dwgSetActive(doc, "ENTOURAGE");
+}
+
+// --- styling ---------------------------------------------------------------
+
+function dwgStylePath(p, pen) {
+    if (p.clipping || p.guides) return;
+    if (pen.fill !== undefined) {
+        p.filled = true;
+        p.fillColor = dwgGray(pen.fill);
+        p.stroked = false;
+        return;
+    }
+    p.filled = false;
+    p.stroked = true;
+    p.strokeColor = dwgGray(pen.k === undefined ? 100 : pen.k);
+    p.strokeWidth = pen.w;
+    p.strokeCap = pen.cap === "butt" ? StrokeCap.BUTTENDCAP : StrokeCap.ROUNDENDCAP;
+    p.strokeJoin = pen.join === "miter" ? StrokeJoin.MITERENDJOIN : StrokeJoin.ROUNDENDJOIN;
+    p.strokeDashes = pen.dash ? pen.dash : [];
+}
+
+function dwgStyleItems(container, pen, counter) {
+    for (var i = 0; i < container.pageItems.length; i++) {
+        var it = container.pageItems[i];
+        var tn = it.typename;
+        if (tn === "PathItem") { dwgStylePath(it, pen); counter.n++; }
+        else if (tn === "CompoundPathItem") {
+            if (it.pathItems.length) { dwgStylePath(it.pathItems[0], pen); counter.n++; }
+        }
+        else if (tn === "GroupItem") dwgStyleItems(it, pen, counter);
+    }
+}
+
+function dwgApplyPens(doc, settings) {
+    var pens = dwgPens(settings.preset, settings.mult);
+    var report = [];
+    for (var name in pens) {
+        var L = dwgFindLayer(doc, name);
+        if (!L || !pens[name].enforce) continue;
+        var wasLocked = L.locked;
+        L.locked = false; L.visible = true;
+        var c = { n: 0 };
+        dwgStyleItems(L, pens[name], c);
+        L.visible = !pens[name].hide;          // e.g. "Outline cut" hides the poche fill
+        if (c.n) report.push(name + " " + c.n);
+        L.locked = wasLocked;
+    }
+    return report;
+}
+
+function dwgFinishLayers(doc, settings) {
+    var colors = { line: [150, 150, 150], add: [0, 150, 255] };
+    for (var i = 0; i < DWG_STACK.length; i++) {
+        var e = DWG_STACK[i];
+        var L = dwgFindLayer(doc, e.name);
+        if (!L) continue;
+        var c = new RGBColor(); var rgb = colors[e.role];
+        c.red = rgb[0]; c.green = rgb[1]; c.blue = rgb[2];
+        L.locked = false;                      // even the Layers-panel colour needs it unlocked
+        L.color = c;
+        if (e.name === "REG") { L.printable = false; L.visible = false; L.locked = true; continue; }
+        if (e.role === "line") L.locked = !!settings.lockLinework;
+    }
+    // the layer you draw on next should be one of yours
+    dwgSetActive(doc, "ENTOURAGE");
+}
+
+// --- settings stored in the file (a hidden, non-printing text on layer REG) ---
+
+function dwgReadRegInfo(doc) {
+    // CleanMake2D writes: DWG|name=..|ratio=96|scale=1/8" = 1'-0"|src=C:/.../Plan.svg
+    var info = {};
+    var L = dwgFindLayer(doc, "REG");
+    if (!L) return info;
+    var frames = dwgCollectText(L, []);
+    for (var i = 0; i < frames.length; i++) {
+        var s = frames[i].contents;
+        if (s.indexOf("DWG|") !== 0) continue;
+        var parts = s.split("|");
+        for (var j = 1; j < parts.length; j++) {
+            var eq = parts[j].indexOf("=");
+            if (eq > 0) info[parts[j].substring(0, eq)] = parts[j].substring(eq + 1);
+        }
+    }
+    return info;
+}
+
+function dwgCollectText(container, out) {
+    for (var i = 0; i < container.pageItems.length; i++) {
+        var it = container.pageItems[i];
+        if (it.typename === "TextFrame") out.push(it);
+        else if (it.typename === "GroupItem") dwgCollectText(it, out);
+    }
+    return out;
+}
+
+function dwgRegCenter(doc) {
+    // centre of the registration circle (first ellipse-like closed path on REG)
+    var L = dwgFindLayer(doc, "REG");
+    if (!L) return null;
+    var paths = [];
+    dwgCollectPaths(L, paths);
+    for (var i = 0; i < paths.length; i++) {
+        var p = paths[i];
+        if (p.closed && p.pathPoints.length >= 4) {
+            var b = p.geometricBounds; // [left, top, right, bottom]
+            return [(b[0] + b[2]) / 2, (b[1] + b[3]) / 2];
+        }
+    }
+    return null;
+}
+
+function dwgCollectPaths(container, out) {
+    var n = container.pageItems ? container.pageItems.length : 0;
+    for (var i = 0; i < n; i++) {
+        try {
+            var it = container.pageItems[i];
+            if (it.typename === "PathItem") out.push(it);
+            else if (it.typename === "GroupItem") dwgCollectPaths(it, out);
+            else if (it.typename === "CompoundPathItem")
+                for (var j = 0; j < it.pathItems.length; j++) out.push(it.pathItems[j]);
+        } catch (e) {}
+    }
+    return out;
+}
+
+var DWG_SETTINGS_LAYER = "_DWG settings";
+
+function dwgLoadSettings(doc) {
+    var s = { preset: "Solid poche", mult: 1.0, lockLinework: true, src: "" };
+    var L = dwgFindLayer(doc, DWG_SETTINGS_LAYER);
+    if (!L) return s;
+    var frames = dwgCollectText(L, []);
+    for (var i = 0; i < frames.length; i++) {
+        var parts = frames[i].contents.split("|");
+        for (var j = 0; j < parts.length; j++) {
+            var eq = parts[j].indexOf("=");
+            if (eq < 0) continue;
+            var k = parts[j].substring(0, eq), v = parts[j].substring(eq + 1);
+            if (k === "mult") s[k] = parseFloat(v) || 1.0;
+            else if (k === "lockLinework") s[k] = (v === "true");
+            else s[k] = v;
+        }
+    }
+    return s;
+}
+
+function dwgSaveSettings(doc, s) {
+    var L = dwgFindLayer(doc, DWG_SETTINGS_LAYER);
+    if (!L) { L = doc.layers.add(); L.name = DWG_SETTINGS_LAYER; }
+    L.locked = false; L.visible = true;
+    doc.activeLayer = L;
+    while (L.pageItems.length) L.pageItems[0].remove();
+    var tf = L.textFrames.add();
+    tf.contents = "preset=" + s.preset + "|mult=" + s.mult + "|lockLinework=" + s.lockLinework +
+                  "|src=" + (s.src || "") + "|ratio=" + (s.ratio || "") + "|scale=" + (s.scale || "");
+    tf.position = [doc.artboards[0].artboardRect[0], doc.artboards[0].artboardRect[1] + 40];
+    // bottom of the stack: Illustrator makes the TOP layer active when a file opens, and a
+    // locked/hidden active layer blocks all drawing, even on other layers.
+    L.zOrder(ZOrderMethod.SENDTOBACK);
+    L.printable = false; L.visible = false; L.locked = true;
+    dwgSetActive(doc, "ENTOURAGE");
+}
+
+// New art is created through the active layer; if that layer is locked or hidden, creating
+// anything anywhere fails ("Target layer cannot be modified"). Always leave a usable one active.
+function dwgSetActive(doc, name) {
+    var L = dwgFindLayer(doc, name);
+    if (!L) L = dwgEnsureLayer(doc, name);
+    L.locked = false; L.visible = true;
+    doc.activeLayer = L;
+    return L;
+}
+
+// --- scale parsing (shared with DWG_Entourage) ----------------------------
+
+// '1/8" = 1'-0"' -> 96, '1/4' -> 48, '1:100' -> 100, '96' -> 96
+function dwgParseRatio(txt) {
+    var s = String(txt).replace(/\s+/g, "");
+    var m = s.match(/^1:(\d+(\.\d+)?)$/);
+    if (m) return parseFloat(m[1]);
+    m = s.match(/^(\d+)?-?(\d+)\/(\d+)"?(=1'(-0"?)?)?$/);      // 1/8 or 1-1/2 or 1/8"=1'-0"
+    if (m) {
+        var inches = (m[1] ? parseFloat(m[1]) : 0) + parseFloat(m[2]) / parseFloat(m[3]);
+        return 12 / inches;
+    }
+    m = s.match(/^(\d+(\.\d+)?)"(=1'(-0"?)?)?$/);               // 1"=1'-0", 3"
+    if (m) return 12 / parseFloat(m[1]);
+    m = s.match(/^\d+(\.\d+)?$/);
+    if (m) return parseFloat(s);
+    return null;
+}
+
+function dwgIsMetric(scaleLabel) { return String(scaleLabel).indexOf(":") >= 0; }
